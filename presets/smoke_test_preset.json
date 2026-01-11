@@ -1,0 +1,15 @@
+{
+  "effect": "Flanger",
+  "rate": 1.5,
+  "depth": 0.8,
+  "mix": 0.6,
+  "feedback": 0.3,
+  "centre_delay_ms": 7.0,
+  "oscillate": "yes",
+  "osc_rate": 0.3,
+  "osc_rate_amount": 0.5,
+  "osc_depth_amount": 0.4,
+  "static_mode": "off",
+  "saved_at": "2026-01-09T19:22:15.267415",
+  "node_version": "1.0.0"
+}
