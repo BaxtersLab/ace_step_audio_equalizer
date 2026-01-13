@@ -1,76 +1,38 @@
-# Baxter’s Comfy Audio Nodes
+# 🎚️ ACE Step Audio Equalizer (v2.0)
 
-A suite of high‑quality custom audio nodes designed to enhance generation workflows in ComfyUI, with full support for ACE‑Step audio pipelines.  
-Each node is self‑contained, optimized for clean DSP behavior, and built for reliable, production‑grade audio processing.
+A clean, tactile 6‑band equalizer with a stereo‑linked limiter and independent left/right channel volume.
 
----
+This is a ComfyUI custom node.
 
-## 🎛️ Included Nodes
+## ✅ I/O
+- **Input**: AUDIO
+- **Output**: AUDIO
 
-### 1. ace_step_audio_equalizer
-A mastering‑grade EQ and dynamics block designed for ACE‑Step audio workflows.
+## 🎛️ UI (18 Lanes)
+Each control uses two vertical lanes:
+- Top lane: slider
+- Bottom lane: static label
 
-**Features**:
-- Biquad EQ filters (low shelf, peak, high shelf)
-- Envelope‑smoothed limiter
-- Gain reduction metering (linear + dB)
-- Limiter hit flag
-- RMS metering
-- Per‑channel peak detection
-- Bypass input
-- Reset and status outputs
+Lane order (top → bottom):
+- Band 1 gain + label (60 Hz)
+- Band 2 gain + label (150 Hz)
+- Band 3 gain + label (400 Hz)
+- Band 4 gain + label (1 kHz)
+- Band 5 gain + label (3 kHz)
+- Band 6 gain + label (8 kHz)
+- Limiter slider + label: `<mild--] limiter [--aggressive>`
+- Left volume + label
+- Right volume + label
 
-> *Ideal for shaping, stabilizing, and preparing audio for downstream processing.*
+## 🔊 DSP
+- Six fixed peaking EQ bands (gain per band)
+- Stereo‑linked soft limiter with stateful envelope
+- Independent left/right output trims
+- Parameter smoothing (“gradient control”) on all controls to prevent zipper noise
 
----
+## 📦 Installation
+Place the folder `ace_step_audio_equalizer` inside:
 
-### 2. ComfyAudioFlanger
-A clean, musical flanger node built for modulation effects inside ComfyUI.
+`ComfyUI/custom_nodes/`
 
-**Features**:
-- Time‑modulated delay line
-- LFO modulation with smoothing
-- Feedback path
-- Wet/dry mix
-- Reset and status outputs
-
-> *Perfect for adding movement, texture, and modulation to generated audio.*
-
----
-
-### 3. spectral_warm_amp_limiter
-A harmonic enhancement and soft‑knee limiting node designed for warmth, saturation, and tactile‑ready output shaping.
-
-**Features**:
-- Harmonic enhancement
-- Saturation / warmth curve
-- Low‑frequency emphasis
-- Soft‑knee limiter
-- Gain computer and output shaping
-- Status output
-
-> *Designed to pair beautifully with tactile audio systems and low‑frequency workflows.*
-
----
-
-## 🧪 Testing
-
-A smoke test is included to validate node output shapes and ensure stable behavior.  
-The suite currently returns 13 outputs from the equalizer node, all verified.
-
----
-
-## 🔐 Repository Status
-
-This repository is currently private while development continues.  
-It will be made public once:
-- The node suite is complete
-- Code has been reviewed for safety
-- No sensitive or machine‑specific data remains
-- Documentation is finalized
-
----
-
-## 📄 License
-
-The license will be added prior to public release.
+Restart ComfyUI. The node appears as **ACE Step Audio Equalizer** under the `audio` category.
