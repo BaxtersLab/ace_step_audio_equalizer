@@ -1,0 +1,3 @@
+# numpy and scipy are present in any ComfyUI environment
+numpy
+scipy

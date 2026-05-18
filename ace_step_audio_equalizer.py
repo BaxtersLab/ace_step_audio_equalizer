@@ -1,12 +1,19 @@
-﻿import math
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import numpy as np
 
 try:
+    import scipy.signal as _scipy_signal
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _scipy_signal = None
+    _SCIPY_AVAILABLE = False
+
+try:
     import torch
-except Exception:  # torch is expected in ComfyUI, but keep import-safe
+except Exception:
     torch = None
 
 
@@ -28,7 +35,6 @@ class _Smoother:
         if n_samples <= 0 or fs <= 0:
             self.value = float(target)
             return start, float(self.value)
-
         tau = max(float(self.time_ms), 0.1) / 1000.0
         alpha = 1.0 - math.exp(-float(n_samples) / (tau * float(fs)))
         end = start + alpha * (float(target) - start)
@@ -38,16 +44,14 @@ class _Smoother:
 
 @dataclass
 class _BiquadState:
-    z1: float = 0.0
-    z2: float = 0.0
+    # zi shape (1, 2) — compatible with scipy.signal.sosfilt and DF2T fallback
+    zi: np.ndarray = field(default_factory=lambda: np.zeros((1, 2), dtype=np.float64))
 
 
 def _design_peaking_eq(fc: float, q: float, gain_db: float, fs: int) -> Tuple[float, float, float, float, float]:
     fc = _clamp(fc, 10.0, 0.45 * float(fs))
     q = max(float(q), 0.05)
-    gain_db = float(gain_db)
-
-    A = 10.0 ** (gain_db / 40.0)
+    A = 10.0 ** (float(gain_db) / 40.0)
     w0 = 2.0 * math.pi * fc / float(fs)
     cos_w0 = math.cos(w0)
     sin_w0 = math.sin(w0)
@@ -61,28 +65,32 @@ def _design_peaking_eq(fc: float, q: float, gain_db: float, fs: int) -> Tuple[fl
     a2 = 1.0 - alpha / A
 
     inv_a0 = 1.0 / a0
-    b0 *= inv_a0
-    b1 *= inv_a0
-    b2 *= inv_a0
-    a1 *= inv_a0
-    a2 *= inv_a0
-
-    return float(b0), float(b1), float(b2), float(a1), float(a2)
+    return float(b0 * inv_a0), float(b1 * inv_a0), float(b2 * inv_a0), float(a1 * inv_a0), float(a2 * inv_a0)
 
 
-def _biquad_process_df2t(x: np.ndarray, b0: float, b1: float, b2: float, a1: float, a2: float, state: _BiquadState) -> np.ndarray:
-    y = np.empty_like(x, dtype=np.float32)
-    z1 = float(state.z1)
-    z2 = float(state.z2)
-    for i in range(int(x.shape[0])):
-        xn = float(x[i])
+def _biquad_process(
+    x: np.ndarray,
+    b0: float, b1: float, b2: float, a1: float, a2: float,
+    state: _BiquadState,
+) -> np.ndarray:
+    x64 = x.astype(np.float64)
+    if _SCIPY_AVAILABLE:
+        sos = np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
+        y, zf = _scipy_signal.sosfilt(sos, x64, zi=state.zi)
+        state.zi = zf
+        return y.astype(np.float32)
+    # Transposed Direct Form II fallback (zi[0,0]=z1, zi[0,1]=z2)
+    y = np.empty_like(x64)
+    z1, z2 = float(state.zi[0, 0]), float(state.zi[0, 1])
+    for i in range(len(x64)):
+        xn = x64[i]
         yn = b0 * xn + z1
         z1 = b1 * xn - a1 * yn + z2
         z2 = b2 * xn - a2 * yn
         y[i] = yn
-    state.z1 = float(z1)
-    state.z2 = float(z2)
-    return y
+    state.zi[0, 0] = z1
+    state.zi[0, 1] = z2
+    return y.astype(np.float32)
 
 
 class AudioEqualizerNode:
@@ -134,16 +142,11 @@ class AudioEqualizerNode:
         self._band_gain_smoothers = [_Smoother(0.0, time_ms=60.0) for _ in range(6)]
         self._band_fc_smoothers = [_Smoother(float(fc), time_ms=200.0) for fc in self._BAND_FC_HZ]
         self._band_q_smoothers = [_Smoother(float(q), time_ms=200.0) for q in self._BAND_Q]
-
         self._limiter_smoother = _Smoother(0.25, time_ms=80.0)
         self._lv_smoother = _Smoother(0.0, time_ms=60.0)
         self._rv_smoother = _Smoother(0.0, time_ms=60.0)
-
         self._biquad_states: list[list[_BiquadState]] = []
         self._limiter_env = 0.0
-
-        self._meter_peak = 0.0
-        self._meter_peak_smooth = 0.0
 
     def _extract_audio(self, audio: Any) -> Tuple[np.ndarray, int, Optional[dict], Optional[Any]]:
         audio_dict = audio if isinstance(audio, dict) else None
@@ -201,40 +204,22 @@ class AudioEqualizerNode:
             return audio_ct
 
         aggressiveness = _clamp(aggressiveness, 0.0, 1.0)
-
-        threshold_db = -1.0 - 8.0 * aggressiveness
+        threshold = _db_to_linear(-1.0 - 8.0 * aggressiveness)
         knee_db = 6.0 + 12.0 * aggressiveness
+        knee_half = _db_to_linear(knee_db / 2.0)
+        makeup = _db_to_linear(3.0 * aggressiveness)
         attack_ms = 4.0 - 2.5 * aggressiveness
         release_ms = 120.0 + 220.0 * aggressiveness
-        makeup_db = 0.0 + 3.0 * aggressiveness
+        a_a = math.exp(-1.0 / (max(attack_ms, 0.1) / 1000.0 * float(fs)))
+        a_r = math.exp(-1.0 / (max(release_ms, 0.1) / 1000.0 * float(fs)))
 
-        threshold = _db_to_linear(threshold_db)
-        makeup = _db_to_linear(makeup_db)
-
-        n_ch, n_samp = int(audio_ct.shape[0]), int(audio_ct.shape[1])
-        if n_samp == 0:
-            return audio_ct
-
-        attack_tc = max(float(attack_ms), 0.1) / 1000.0
-        release_tc = max(float(release_ms), 0.1) / 1000.0
-        a_a = math.exp(-1.0 / (attack_tc * float(fs)))
-        a_r = math.exp(-1.0 / (release_tc * float(fs)))
-
+        n_samp = int(audio_ct.shape[1])
         env = float(self._limiter_env)
         y = np.empty_like(audio_ct, dtype=np.float32)
-        knee_half = _db_to_linear(knee_db / 2.0)
 
         for i in range(n_samp):
-            peak = 0.0
-            for ch in range(n_ch):
-                v = abs(float(audio_ct[ch, i]))
-                if v > peak:
-                    peak = v
-
-            if peak > env:
-                env = (1.0 - a_a) * peak + a_a * env
-            else:
-                env = (1.0 - a_r) * peak + a_r * env
+            peak = float(np.max(np.abs(audio_ct[:, i])))
+            env = ((1.0 - a_a) * peak + a_a * env) if peak > env else ((1.0 - a_r) * peak + a_r * env)
 
             if env <= threshold:
                 gain = 1.0
@@ -246,9 +231,7 @@ class AudioEqualizerNode:
                 else:
                     gain = 1.0 / over
 
-            g = float(gain) * makeup
-            for ch in range(n_ch):
-                y[ch, i] = _clamp(float(audio_ct[ch, i]) * g, -1.0, 1.0)
+            y[:, i] = np.clip(audio_ct[:, i] * (gain * makeup), -1.0, 1.0)
 
         self._limiter_env = float(env)
         return y
@@ -256,24 +239,15 @@ class AudioEqualizerNode:
     def process(
         self,
         audio,
-        band1_gain_db,
-        band1_label,
-        band2_gain_db,
-        band2_label,
-        band3_gain_db,
-        band3_label,
-        band4_gain_db,
-        band4_label,
-        band5_gain_db,
-        band5_label,
-        band6_gain_db,
-        band6_label,
-        limiter,
-        limiter_label,
-        left_volume_db,
-        left_volume_label,
-        right_volume_db,
-        right_volume_label,
+        band1_gain_db, band1_label,
+        band2_gain_db, band2_label,
+        band3_gain_db, band3_label,
+        band4_gain_db, band4_label,
+        band5_gain_db, band5_label,
+        band6_gain_db, band6_label,
+        limiter, limiter_label,
+        left_volume_db, left_volume_label,
+        right_volume_db, right_volume_label,
     ):
         wf_bct, sample_rate, audio_dict, torch_device = self._extract_audio(audio)
         if wf_bct.size == 0:
@@ -284,12 +258,8 @@ class AudioEqualizerNode:
         self._ensure_states(n_ch)
 
         band_targets = [
-            float(band1_gain_db),
-            float(band2_gain_db),
-            float(band3_gain_db),
-            float(band4_gain_db),
-            float(band5_gain_db),
-            float(band6_gain_db),
+            float(band1_gain_db), float(band2_gain_db), float(band3_gain_db),
+            float(band4_gain_db), float(band5_gain_db), float(band6_gain_db),
         ]
         lv_target_db = float(left_volume_db)
         rv_target_db = float(right_volume_db)
@@ -311,35 +281,20 @@ class AudioEqualizerNode:
                     _, gain_db = self._band_gain_smoothers[band_idx].step(_clamp(band_targets[band_idx], -18.0, 18.0), n_blk, fs)
                     _, fc = self._band_fc_smoothers[band_idx].step(float(self._BAND_FC_HZ[band_idx]), n_blk, fs)
                     _, q = self._band_q_smoothers[band_idx].step(float(self._BAND_Q[band_idx]), n_blk, fs)
-
                     b0, b1, b2, a1, a2 = _design_peaking_eq(float(fc), float(q), float(gain_db), fs)
                     for ch in range(n_ch):
-                        state = self._biquad_states[band_idx][ch]
-                        y_ct[ch, start:end] = _biquad_process_df2t(y_ct[ch, start:end], b0, b1, b2, a1, a2, state)
+                        y_ct[ch, start:end] = _biquad_process(y_ct[ch, start:end], b0, b1, b2, a1, a2, self._biquad_states[band_idx][ch])
 
                 lv_start, lv_end = self._lv_smoother.step(_clamp(lv_target_db, -24.0, 6.0), n_blk, fs)
                 rv_start, rv_end = self._rv_smoother.step(_clamp(rv_target_db, -24.0, 6.0), n_blk, fs)
 
-                lv0 = _db_to_linear(lv_start)
-                lv1 = _db_to_linear(lv_end)
-                rv0 = _db_to_linear(rv_start)
-                rv1 = _db_to_linear(rv_end)
-
                 if n_ch >= 1:
-                    g = np.linspace(lv0, lv1, n_blk, endpoint=False, dtype=np.float32)
-                    y_ct[0, start:end] *= g
+                    y_ct[0, start:end] *= np.linspace(_db_to_linear(lv_start), _db_to_linear(lv_end), n_blk, endpoint=False, dtype=np.float32)
                 if n_ch >= 2:
-                    g = np.linspace(rv0, rv1, n_blk, endpoint=False, dtype=np.float32)
-                    y_ct[1, start:end] *= g
+                    y_ct[1, start:end] *= np.linspace(_db_to_linear(rv_start), _db_to_linear(rv_end), n_blk, endpoint=False, dtype=np.float32)
 
             _, lim_end = self._limiter_smoother.step(_clamp(lim_target, 0.0, 1.0), n_samp, fs)
             y_ct = self._apply_limiter(y_ct, lim_end, fs)
-
-            peak = float(np.max(np.abs(y_ct))) if y_ct.size else 0.0
-            self._meter_peak = peak
-            meter_alpha = 1.0 - math.exp(-float(n_samp) / (0.08 * float(fs)))
-            self._meter_peak_smooth = float(self._meter_peak_smooth + meter_alpha * (peak - self._meter_peak_smooth))
-
             out[b] = y_ct
 
         return (self._pack_audio(out, sample_rate, audio_dict, torch_device),)
